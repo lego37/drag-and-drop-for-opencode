@@ -1,4 +1,28 @@
-opencode/
-patch/
+# Local OpenCode source tree and generated patch payloads
+/opencode/
+/patch/
+
+# Dependencies and build output
 node_modules/
+dist/
+out/
+build/
+
+# Archives, backups, and temporary files
+*.asar
+*.asar.unpacked/
+*.bak
+*.tmp
+*.pre-patch
 *.log
+
+# Windows launchers kept local
+*.bat
+*.cmd
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
