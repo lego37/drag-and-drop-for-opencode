@@ -77,13 +77,15 @@ Les nouvelles chaînes i18n sont uniquement en anglais. Les autres locales retom
 
 OpenCode exige une feature request et une validation de design avant toute PR d'implémentation (`CONTRIBUTING.md`). Le code est prêt, mais **aucune PR n'a été ouverte**.
 
+Feature request : [#59049](https://github.com/anomalyco/opencode/issues/59049) — déplacer des sessions entre projets par glisser-déposer sur l'accueil. Elle attend une validation de design.
+
 La possibilité de déplacer une session entre projets a déjà été demandée :
 
 - [#24708](https://github.com/anomalyco/opencode/issues/24708) — « move a session », fermée comme doublon de #23249 ;
 - [#23249](https://github.com/anomalyco/opencode/issues/23249) — dialogue de migration de session, fermée par le bot de nettoyage ;
 - [#21400](https://github.com/anomalyco/opencode/issues/21400) — déplacer/cloner une session dans un autre projet, fermée par le bot de nettoyage.
 
-Aucune de ces demandes ne proposait le **glisser-déposer sur l'écran d'accueil**, et l'API serveur `session.move` n'existait pas lorsqu'elles ont été fermées. La nouvelle feature request doit le dire explicitement, renvoyer vers ces anciennes issues et demander une validation de design.
+Aucune de ces demandes ne proposait le **glisser-déposer sur l'écran d'accueil**, et l'API serveur `session.move` n'existait pas lorsqu'elles ont été fermées. La feature request le dit explicitement, renvoie vers ces anciennes issues et demande une validation de design.
 
 Les sons de notification sont un sujet séparé. Issues existantes :
 

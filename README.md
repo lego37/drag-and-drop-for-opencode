@@ -75,13 +75,15 @@ The new i18n strings are English-only. Other locales fall back to English until 
 
 OpenCode requires a feature request and design approval before an implementation PR (`CONTRIBUTING.md`). The code is ready, but **no PR has been opened yet**.
 
+Feature request: [#59049](https://github.com/anomalyco/opencode/issues/59049) — move sessions between projects by dragging them on Home. It is waiting for design approval.
+
 The ability to move a session between projects has been requested before:
 
 - [#24708](https://github.com/anomalyco/opencode/issues/24708) — "move a session", closed as a duplicate of #23249;
 - [#23249](https://github.com/anomalyco/opencode/issues/23249) — session migration dialog, closed by the stale bot;
 - [#21400](https://github.com/anomalyco/opencode/issues/21400) — move/clone a session into another project, closed by the stale bot.
 
-None of those proposed **drag-and-drop on the Home screen**, and the server-side `session.move` API did not exist when they were closed. The feature request should say that explicitly, link to the old issues, and ask for design approval.
+None of those proposed **drag-and-drop on the Home screen**, and the server-side `session.move` API did not exist when they were closed. The feature request says that explicitly, links to the old issues, and asks for design approval.
 
 Notification sounds are a separate topic. Existing issues:
 
