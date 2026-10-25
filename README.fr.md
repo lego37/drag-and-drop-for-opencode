@@ -186,6 +186,18 @@ node apply-desktop-patch.mjs
 
 Une fois le script terminé, **lancer OpenCode vous-même**. Il ne démarre ni ne redémarre jamais l'application.
 
+### Mettre à jour un patch local installé
+
+Si vous reconstruisez le renderer et générez un nouveau manifeste alors qu'un ancien patch est encore installé, `--check` affiche `unknown` : l'archive installée ne correspond ni à l'originale ni au nouveau patch. Restaurez d'abord une sauvegarde originale vérifiée, puis appliquez le nouveau patch :
+
+```powershell
+node apply-desktop-patch.mjs --revert --force --backup "patch\backup\app.asar.2.1.4-original-<horodatage>.bak"
+node apply-desktop-patch.mjs --check
+node apply-desktop-patch.mjs
+```
+
+`--force` n'est nécessaire que pour cette transition, car l'empreinte installée ne figure pas dans le nouveau manifeste. Il ignore la vérification de l'empreinte de la sauvegarde : utilisez une sauvegarde dont vous avez vérifié le SHA-256 par rapport à `manifest.original.sha256`.
+
 ### Restaurer l'archive d'origine
 
 ```powershell
