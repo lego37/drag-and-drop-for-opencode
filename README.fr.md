@@ -257,7 +257,8 @@ Le patch 2.1.4 contient aussi une couche expérimentale de sons de notification.
 
 - #41355 couvre les sons de notification/erreur configurables.
 - #49371 couvre le son quand l'agent pose une question.
-- Le patch actuel ne joue pas de son sur `question.asked` ; il ajoute seulement un son aux toasts d'échec du dock de question. Ne pas affirmer que #49371 est corrigé.
+- Le patch local joue désormais le son **Questions** configurable lorsqu'un formulaire de question est créé (`form.created` avec `metadata.kind: "question"`) dans une session dont un onglet est ouvert. Le son se configure dans **Paramètres > Notifications > Sons**. Cela ne ferme pas #49371 en amont : la modification reste locale.
+- Vérifications locales du 25/10/2026 : les tests unitaires ciblés (24 réussis) et le nouveau test e2e du son de question passent ; `bun run typecheck` et `bun run typecheck:tsc` sont propres.
 
 ## Version anglaise
 

@@ -255,7 +255,8 @@ The 2.1.4 patch also contains an experimental notification-sound layer. It is **
 
 - #41355 covers configurable notification/error sounds.
 - #49371 covers a sound when the agent asks a question.
-- The current patch does not play a sound on `question.asked`; it only tags failure toasts in the question dock. Do not claim #49371 is fixed.
+- The local patch now plays the configurable **Questions** sound when a question form is created (`form.created` with `metadata.kind: "question"`) for a session with an open tab. The sound is configured in **Settings > Notifications > Sounds**. This does not close #49371 upstream; the change is local-only.
+- Local verification on 25/10/2026: the focused unit tests (24 passed) and the new question-sound e2e check pass; `bun run typecheck` and `bun run typecheck:tsc` are clean.
 
 ## French version
 

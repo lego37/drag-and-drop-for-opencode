@@ -43,6 +43,92 @@ index ddc15b8..5634bde 100644
  test("the Home shortcut focuses session search, and the Home button leaves focus alone", async ({ page }) => {
    await mockStressTimeline(page)
    await seed(page, {
+diff --git a/packages/app/e2e/regression/session-request-docks.spec.ts b/packages/app/e2e/regression/session-request-docks.spec.ts
+index 2206c0e..fbf6dbc 100644
+--- a/packages/app/e2e/regression/session-request-docks.spec.ts
++++ b/packages/app/e2e/regression/session-request-docks.spec.ts
+@@ -10,6 +10,12 @@ const sessionID = "ses_request_docks"
+ 
+ const title = "Request dock regression"
+ 
++declare global {
++  interface Window {
++    __playedSounds?: string[]
++  }
++}
++
+ test("shows a pending question dock", async ({ page }) => {
+   await mockServer(page, {
+     forms: [
+@@ -280,6 +286,68 @@ test("restores the draft caret before typing after a request dock closes", async
+   await expect(editor).toHaveText(`${draft.slice(0, cursor)}x${draft.slice(cursor)}`)
+ })
+ 
++test("plays the configured question sound when a question form is created", async ({ page }) => {
++  await page.addInitScript(() => {
++    const played: string[] = []
++    window.__playedSounds = played
++
++    class TestAudio {
++      currentTime = 0
++
++      constructor(src?: string) {
++        if (src) played.push(src)
++      }
++
++      play() {
++        return Promise.resolve()
++      }
++
++      pause() {}
++    }
++
++    Object.defineProperty(window, "Audio", { configurable: true, value: TestAudio })
++  })
++
++  const transport = await installSseTransport(page, { server: SERVER, retry: 20 })
++  await mockServer(page, { forms: [] })
++  await page.goto(sessionHref(sessionID))
++  await transport.waitForConnection()
++  await expectSessionTitle(page, title)
++
++  await transport.send({
++    id: "evt_question_sound",
++    created: 1700000003000,
++    type: "form.created",
++    location: { directory },
++    data: {
++      form: {
++        id: "frm_question_sound",
++        sessionID,
++        title: "Questions",
++        metadata: { kind: "question" },
++        fields: [
++          {
++            key: "q0",
++            type: "string",
++            title: "Continue",
++            description: "Continue?",
++            options: [{ value: "yes", label: "Yes", description: "Continue the session" }],
++            custom: true,
++          },
++        ],
++      },
++    },
++  })
++
++  await expect
++    .poll(async () => {
++      const played = await page.evaluate(() => window.__playedSounds ?? [])
++
++      return played.some((src) => src.includes("staplebops-03"))
++    })
++    .toBe(true)
++})
++
+ function mockServer(page: Page, requests: Pick<WorkspaceInput, "sessionPermissions" | "onPermissionReply" | "forms">) {
+   return mockWorkspace(page, { name: "RequestDocks", directory, sessions: [{ id: sessionID, title }], ...requests })
+ }
 diff --git a/packages/app/e2e/utils/mock-api.ts b/packages/app/e2e/utils/mock-api.ts
 index 781d78f..39f9829 100644
 --- a/packages/app/e2e/utils/mock-api.ts
@@ -650,7 +736,7 @@ index 3939415..3afc02e 100644
    }))
  
 diff --git a/packages/app/src/runtime/i18n/en.ts b/packages/app/src/runtime/i18n/en.ts
-index a6842d8..558cb8a 100644
+index a6842d8..d2c8079 100644
 --- a/packages/app/src/runtime/i18n/en.ts
 +++ b/packages/app/src/runtime/i18n/en.ts
 @@ -428,6 +428,8 @@ export const dict = {
@@ -670,8 +756,12 @@ index a6842d8..558cb8a 100644
    "sound.option.alert01": "Alert 01",
    "sound.option.alert02": "Alert 02",
    "sound.option.alert03": "Alert 03",
-@@ -909,6 +912,37 @@ export const dict = {
+@@ -907,8 +910,41 @@ export const dict = {
+   "settings.general.sounds.agent.description": "Play sound when the agent is complete or needs attention",
+   "settings.general.sounds.permissions.title": "Permissions",
    "settings.general.sounds.permissions.description": "Play sound when a permission is required",
++  "settings.general.sounds.question.title": "Questions",
++  "settings.general.sounds.question.description": "Play sound when a question needs an answer",
    "settings.general.sounds.errors.title": "Errors",
    "settings.general.sounds.errors.description": "Play sound when an error occurs",
 +  "settings.general.sounds.move.title": "Session moved",
@@ -1044,7 +1134,7 @@ index 01ce931..02a1653 100644
        return
      }
 diff --git a/packages/app/src/settings/general/controllers.ts b/packages/app/src/settings/general/controllers.ts
-index e6e7c3d..2e05ce8 100644
+index e6e7c3d..aacdf6f 100644
 --- a/packages/app/src/settings/general/controllers.ts
 +++ b/packages/app/src/settings/general/controllers.ts
 @@ -14,6 +14,10 @@ import {
@@ -1134,7 +1224,19 @@ index e6e7c3d..2e05ce8 100644
    return {
      agent: channel(
        settings.sounds.agentEnabled,
-@@ -171,6 +218,22 @@ export function createSoundSettingsController() {
+@@ -165,12 +212,34 @@ export function createSoundSettingsController() {
+       (value) => settings.sounds.setPermissionsEnabled(value),
+       (id) => settings.sounds.setPermissions(id),
+     ),
++    question: channel(
++      settings.sounds.questionEnabled,
++      settings.sounds.question,
++      (value) => settings.sounds.setQuestionEnabled(value),
++      (id) => settings.sounds.setQuestion(id),
++    ),
+     errors: channel(
+       settings.sounds.errorsEnabled,
+       settings.sounds.errors,
        (value) => settings.sounds.setErrorsEnabled(value),
        (id) => settings.sounds.setErrors(id),
      ),
@@ -1158,11 +1260,15 @@ index e6e7c3d..2e05ce8 100644
  }
  
 diff --git a/packages/app/src/settings/model.test.ts b/packages/app/src/settings/model.test.ts
-index b83db39..7ca908f 100644
+index b83db39..9e2c512 100644
 --- a/packages/app/src/settings/model.test.ts
 +++ b/packages/app/src/settings/model.test.ts
-@@ -116,6 +116,11 @@ describe("settings schema", () => {
+@@ -114,8 +114,15 @@ describe("settings schema", () => {
+         agent: "staplebops-01",
+         permissionsEnabled: true,
          permissions: "staplebops-02",
++        questionEnabled: true,
++        question: "staplebops-03",
          errorsEnabled: true,
          errors: "nope-03",
 +        moveEnabled: true,
@@ -1174,7 +1280,7 @@ index b83db39..7ca908f 100644
      })
    })
 diff --git a/packages/app/src/settings/model.tsx b/packages/app/src/settings/model.tsx
-index 8efa301..049d819 100644
+index 8efa301..d3e23eb 100644
 --- a/packages/app/src/settings/model.tsx
 +++ b/packages/app/src/settings/model.tsx
 @@ -3,6 +3,7 @@ import { createEffect, createMemo } from "solid-js"
@@ -1185,8 +1291,12 @@ index 8efa301..049d819 100644
  import { persisted } from "@/runtime/persistence/storage"
  import { Persistence } from "@/runtime/persistence/schema"
  import { ScopedKey, type ServerScope } from "@/runtime/server/scope"
-@@ -161,6 +162,11 @@ const soundsSchema = Persistence.struct({
+@@ -159,8 +160,15 @@ const soundsSchema = Persistence.struct({
+   agent: Schema.String,
+   permissionsEnabled: Schema.Boolean,
    permissions: Schema.String,
++  questionEnabled: Schema.Boolean,
++  question: Schema.String,
    errorsEnabled: Schema.Boolean,
    errors: Schema.String,
 +  moveEnabled: Schema.Boolean,
@@ -1197,8 +1307,12 @@ index 8efa301..049d819 100644
  })
  
  export const settingsSchema = Persistence.struct({
-@@ -296,6 +302,11 @@ export const defaultSettings: Settings = {
+@@ -294,8 +302,15 @@ export const defaultSettings: Settings = {
+     agent: "staplebops-01",
+     permissionsEnabled: true,
      permissions: "staplebops-02",
++    questionEnabled: true,
++    question: "staplebops-03",
      errorsEnabled: true,
      errors: "nope-03",
 +    moveEnabled: true,
@@ -1209,7 +1323,22 @@ index 8efa301..049d819 100644
    },
  }
  
-@@ -511,6 +522,34 @@ export const { use: useSettings, provider: SettingsProvider } = createSimpleCont
+@@ -503,6 +518,14 @@ export const { use: useSettings, provider: SettingsProvider } = createSimpleCont
+         setPermissions(value: string) {
+           setStore("sounds", "permissions", value)
+         },
++        questionEnabled: withFallback(() => store.sounds?.questionEnabled, defaultSettings.sounds.questionEnabled),
++        setQuestionEnabled(value: boolean) {
++          setStore("sounds", "questionEnabled", value)
++        },
++        question: withFallback(() => store.sounds?.question, defaultSettings.sounds.question),
++        setQuestion(value: string) {
++          setStore("sounds", "question", value)
++        },
+         errorsEnabled: withFallback(() => store.sounds?.errorsEnabled, defaultSettings.sounds.errorsEnabled),
+         setErrorsEnabled(value: boolean) {
+           setStore("sounds", "errorsEnabled", value)
+@@ -511,6 +534,34 @@ export const { use: useSettings, provider: SettingsProvider } = createSimpleCont
          setErrors(value: string) {
            setStore("sounds", "errors", value)
          },
@@ -1245,7 +1374,7 @@ index 8efa301..049d819 100644
      }
    },
 diff --git a/packages/app/src/settings/notifications/notifications.tsx b/packages/app/src/settings/notifications/notifications.tsx
-index a87733a..88460ba 100644
+index a87733a..c6cc415 100644
 --- a/packages/app/src/settings/notifications/notifications.tsx
 +++ b/packages/app/src/settings/notifications/notifications.tsx
 @@ -1,6 +1,7 @@
@@ -1268,7 +1397,17 @@ index a87733a..88460ba 100644
  import "@/settings/settings.css"
  
  const soundSettings = {
-@@ -28,10 +31,20 @@ const soundSettings = {
+@@ -23,15 +26,30 @@ const soundSettings = {
+     title: "settings.general.sounds.permissions.title",
+     description: "settings.general.sounds.permissions.description",
+   },
++  question: {
++    action: "settings-sounds-question",
++    title: "settings.general.sounds.question.title",
++    description: "settings.general.sounds.question.description",
++  },
+   errors: {
+     action: "settings-sounds-errors",
      title: "settings.general.sounds.errors.title",
      description: "settings.general.sounds.errors.description",
    },
@@ -1286,11 +1425,11 @@ index a87733a..88460ba 100644
  
  const SoundSetting: Component<{
 -  kind: "agent" | "permissions" | "errors"
-+  kind: "agent" | "permissions" | "errors" | "move" | "toast"
++  kind: "agent" | "permissions" | "question" | "errors" | "move" | "toast"
    channel: SoundSettingsController["agent"]
  }> = (props) => {
    const language = useLanguage()
-@@ -58,6 +71,7 @@ export const SettingsNotifications: Component = () => {
+@@ -58,6 +76,7 @@ export const SettingsNotifications: Component = () => {
    const language = useLanguage()
    const settings = useSettings()
    const sounds = createSoundSettingsController()
@@ -1298,9 +1437,11 @@ index a87733a..88460ba 100644
  
    return (
      <>
-@@ -120,7 +134,53 @@ export const SettingsNotifications: Component = () => {
+@@ -119,8 +138,55 @@ export const SettingsNotifications: Component = () => {
+           <SettingsList>
              <SoundSetting kind="agent" channel={sounds.agent} />
              <SoundSetting kind="permissions" channel={sounds.permissions} />
++            <SoundSetting kind="question" channel={sounds.question} />
              <SoundSetting kind="errors" channel={sounds.errors} />
 +            <SoundSetting kind="move" channel={sounds.move} />
 +            <SoundSetting kind="toast" channel={sounds.toast} />
@@ -1411,10 +1552,25 @@ index 026a5cc..a83dd26 100644
            description: language.tDynamic("provider.disconnect.toast.failed.description", message, { provider: name }),
          })
 diff --git a/packages/app/src/settings/search-catalog.ts b/packages/app/src/settings/search-catalog.ts
-index 590c572..2f9b728 100644
+index 590c572..0e6fa56 100644
 --- a/packages/app/src/settings/search-catalog.ts
 +++ b/packages/app/src/settings/search-catalog.ts
-@@ -152,6 +152,30 @@ export const clientSettings: Entry<SettingsRootTab>[] = [
+@@ -144,6 +144,14 @@ export const clientSettings: Entry<SettingsRootTab>[] = [
+     description: "settings.general.sounds.permissions.description",
+     keywords: "sound audio permissions",
+   },
++  {
++    tab: "notifications",
++    label: "settings.general.sounds.question.title",
++    target: "settings-sounds-question",
++    section: "settings.general.section.sounds",
++    description: "settings.general.sounds.question.description",
++    keywords: "sound audio question questions input response",
++  },
+   {
+     tab: "notifications",
+     label: "settings.general.sounds.errors.title",
+@@ -152,6 +160,30 @@ export const clientSettings: Entry<SettingsRootTab>[] = [
      description: "settings.general.sounds.errors.description",
      keywords: "sound audio errors",
    },
@@ -1473,6 +1629,104 @@ index ac2c9fe..fe83757 100644
          variant: "error",
          title: language.t("workspace.delete.failed.title"),
          description: error instanceof Error ? error.message : language.t("common.requestFailed"),
+diff --git a/packages/app/src/shell/notifications/notification.test.ts b/packages/app/src/shell/notifications/notification.test.ts
+index d14f6d5..3a4bbb8 100644
+--- a/packages/app/src/shell/notifications/notification.test.ts
++++ b/packages/app/src/shell/notifications/notification.test.ts
+@@ -1,7 +1,13 @@
+ import { expect, test } from "bun:test"
+ import type { ServerConnection } from "@/runtime/server/registry"
+ import type { Tab } from "@/shell/tabs/tabs"
+-import { openNotificationSession } from "./notification"
++import { openNotificationSession, questionFormSession } from "./notification"
++
++test("recognizes only question forms", () => {
++  expect(questionFormSession({ sessionID: "session-1", metadata: { kind: "question" } })).toBe("session-1")
++  expect(questionFormSession({ sessionID: "session-1", metadata: { kind: "mcp-elicitation" } })).toBeUndefined()
++  expect(questionFormSession({ sessionID: "session-1" })).toBeUndefined()
++})
+ 
+ test("opens notification sessions through the tab router", () => {
+   const server = "local\nhttp://localhost:4096" as ServerConnection.Key
+diff --git a/packages/app/src/shell/notifications/notification.tsx b/packages/app/src/shell/notifications/notification.tsx
+index b841a20..4772768 100644
+--- a/packages/app/src/shell/notifications/notification.tsx
++++ b/packages/app/src/shell/notifications/notification.tsx
+@@ -1,7 +1,7 @@
+ import { createEffect, createMemo, onCleanup, untrack } from "solid-js"
+ import { createStore } from "solid-js/store"
+ import { Schema } from "effect"
+-import type { SessionInfo } from "@opencode/client/promise"
++import type { FormInfo, SessionInfo } from "@opencode/client/promise"
+ import type { ServerSDK } from "@/runtime/server/client"
+ import type { Data } from "@opencode/client/solid"
+ import { usePlatform } from "@/runtime/platform/platform"
+@@ -25,6 +25,11 @@ export function openNotificationSession(tabs: NotificationTabs, server: ServerCo
+   tabs.select(tab)
+ }
+ 
++/** Questions are forms; other form kinds (elicitation, web search) have their own handling or no sound. */
++export function questionFormSession(form: Pick<FormInfo, "sessionID" | "metadata">) {
++  return form.metadata?.kind === "question" ? form.sessionID : undefined
++}
++
+ /** A session is unread when its latest terminal execution is newer than the last one any client viewed. */
+ function isSessionUnread(session?: Pick<SessionInfo, "time">) {
+   const time = session?.time
+@@ -216,6 +221,40 @@ export function createServerNotificationState(input: {
+       .catch(() => undefined)
+   }
+ 
++  // A question from a subagent surfaces in every open ancestor's dock, so any open tab in the chain counts.
++  const lookupChain = async (sessionID: string) => {
++    const seen = new Set<string>()
++    const ids = [sessionID]
++    let session = await lookup(sessionID)
++
++    while (session?.parentID && !seen.has(session.parentID)) {
++      seen.add(session.parentID)
++      ids.push(session.parentID)
++      session = await lookup(session.parentID)
++    }
++
++    return ids
++  }
++
++  const handleFormCreated = (form: FormInfo) => {
++    const sessionID = questionFormSession(form)
++
++    if (!sessionID) return
++
++    void lookupChain(sessionID).then((ids) => {
++      if (disposed.value) return
++
++      if (!ids.some((id) => sessionIDHasOpenTab(tabs.store, input.key, id))) return
++
++      if (!settings.sounds.questionEnabled()) return
++
++      // A form ID is stable across replayed events, so it dedupes better than the event ID.
++      void input.coordinator.sound(`${input.key}\0question:${form.id}`, () =>
++        playSoundById(settings.sounds.question()),
++      )
++    })
++  }
++
+   const handleSessionIdle = (sessionID: string, eventID: string) => {
+     void lookup(sessionID).then((session) => {
+       if (disposed.value) return
+@@ -265,6 +304,12 @@ export function createServerNotificationState(input: {
+   }
+ 
+   const unsub = input.sdk.event.listen((event) => {
++    if (event.type === "form.created") {
++      handleFormCreated(event.data.form)
++
++      return
++    }
++
+     if (event.type === "session.execution.failed") {
+       handleSessionError(event.data.sessionID, event.id)
+ 
 diff --git a/packages/app/src/shell/notifications/toast-sound.test.ts b/packages/app/src/shell/notifications/toast-sound.test.ts
 new file mode 100644
 index 0000000..75a5cb5
