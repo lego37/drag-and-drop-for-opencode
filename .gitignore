@@ -1,0 +1,4 @@
+opencode/
+patch/
+node_modules/
+*.log

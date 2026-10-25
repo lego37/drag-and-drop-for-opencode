@@ -1,0 +1,1715 @@
+diff --git a/packages/app/e2e/regression/home.spec.ts b/packages/app/e2e/regression/home.spec.ts
+index ddc15b8..5634bde 100644
+--- a/packages/app/e2e/regression/home.spec.ts
++++ b/packages/app/e2e/regression/home.spec.ts
+@@ -77,6 +77,40 @@ test("the session context menu renames, exports, and deletes a Home session", as
+   await expect(renamedRow).toBeHidden()
+ })
+ 
++test("dragging a Home session onto another project moves it there", async ({ page }) => {
++  const destination = "C:/OpenCode/SecondProject"
++  const secondName = "Second Project"
++  await mockStressTimeline(page, {
++    projects: [fixture.project, project({ id: "proj_second", directory: destination, name: secondName })],
++  })
++  await seed(page, {
++    projects: {
++      local: [
++        { worktree: fixture.directory, expanded: true },
++        { worktree: destination, expanded: true },
++      ],
++    },
++    lastProject: { local: fixture.directory },
++  })
++  await page.goto("/")
++
++  const session = row(page, fixture.expected.targetTitle)
++  const target = page.locator('[data-component="home-project-row"]').filter({ hasText: secondName })
++  await expect(session).toContainText(fixture.project.name)
++  await expect(target).toBeVisible()
++
++  const moved = page.waitForRequest(
++    (request) =>
++      request.method() === "POST" && new URL(request.url()).pathname.endsWith(`/session/${fixture.targetID}/move`),
++  )
++
++  await session.dragTo(target)
++
++  expect((await moved).postDataJSON()).toEqual({ directory: destination })
++  await expect(session).toContainText(secondName)
++  await expect(session).not.toContainText(fixture.project.name)
++})
++
+ test("the Home shortcut focuses session search, and the Home button leaves focus alone", async ({ page }) => {
+   await mockStressTimeline(page)
+   await seed(page, {
+diff --git a/packages/app/e2e/utils/mock-api.ts b/packages/app/e2e/utils/mock-api.ts
+index 781d78f..39f9829 100644
+--- a/packages/app/e2e/utils/mock-api.ts
++++ b/packages/app/e2e/utils/mock-api.ts
+@@ -310,6 +310,14 @@ const Group = HttpApiGroup.make("mock")
+       success: NoContent,
+     }),
+   )
++  .add(
++    HttpApiEndpoint.post("sessionMove", "/api/session/:sessionID/move", {
++      params: SessionParams,
++      payload: JsonPayload,
++      success: NoContent,
++      error: [MockBadRequest.pipe(HttpApiSchema.status(400)), MockNotFound.pipe(HttpApiSchema.status(404))],
++    }),
++  )
+   .add(
+     HttpApiEndpoint.post("sessionShell", "/api/session/:sessionID/shell", {
+       params: SessionParams,
+diff --git a/packages/app/e2e/utils/mock-server.ts b/packages/app/e2e/utils/mock-server.ts
+index 4f557aa..10a7d0e 100644
+--- a/packages/app/e2e/utils/mock-server.ts
++++ b/packages/app/e2e/utils/mock-server.ts
+@@ -662,11 +662,16 @@ function createPty(config: MockServerConfig) {
+   })
+ }
+ 
+-// Every directory this server's configuration names: its own, project and inventory worktrees, and session locations.
+-function ownedDirectories(config: MockServerConfig) {
+-  const projects = [config.project, ...(config.projects ? resolve(config.projects) : [])].flatMap((item) =>
++// The configured project plus any replacement inventory, decoded to the fields the mock reads.
++function projectInventory(config: MockServerConfig) {
++  return [config.project, ...(config.projects ? resolve(config.projects) : [])].flatMap((item) =>
+     Option.toArray(decodeProject(item)),
+   )
++}
++
++// Every directory this server's configuration names: its own, project and inventory worktrees, and session locations.
++function ownedDirectories(config: MockServerConfig) {
++  const projects = projectInventory(config)
+ 
+   return new Set(
+     [
+@@ -1221,6 +1226,44 @@ function mockHandlers(
+               : Effect.fail(new MockNotFound({ message: "Session not found" }))
+           }),
+         sessionRemove: () => noContent,
++        // Like the server: keep the session record, publish `session.moved`, and answer before the drain applies a
++        // queued move. The mock has no runner, so the event is the only observable effect.
++        sessionMove: (ctx) =>
++          Effect.suspend((): Effect.Effect<void, MockBadRequest | MockNotFound> => {
++            const request = Option.getOrUndefined(decodeSessionMove(ctx.payload))
++
++            if (!request) return Effect.fail(new MockBadRequest({ message: "Invalid move request" }))
++            const session = config.sessions.find((item) => item.id === ctx.params.sessionID)
++
++            if (!session) return Effect.fail(new MockNotFound({ message: "Session not found" }))
++
++            return Effect.sync(() => {
++              const directory = request.directory
++
++              const project = projectInventory(config).find(
++                (item) =>
++                  item.worktree === directory || item.canonical === directory || item.sandboxes?.includes(directory),
++              )
++
++              const projectID =
++                project?.id ?? projectSeed(config)?.id ?? (Predicate.isString(session.projectID) ? session.projectID : "project")
++
++              session.directory = directory
++              session.location = { directory }
++              session.projectID = projectID
++              state.emit([
++                {
++                  id: `evt_session_moved_${ctx.params.sessionID}`,
++                  type: "session.moved",
++                  created: Date.now(),
++                  durable: { aggregateID: ctx.params.sessionID, seq: 1, version: 1 },
++                  data: { sessionID: ctx.params.sessionID, location: { directory }, projectID },
++                },
++              ])
++
++              return HttpApiSchema.NoContent.make()
++            })
++          }),
+         sessionShell: () => noContent,
+         sessionForm: (ctx) =>
+           Effect.succeed({
+@@ -1550,6 +1593,8 @@ const decodeSessionCreate = Schema.decodeUnknownOption(
+ 
+ const decodeSessionRename = Schema.decodeUnknownOption(Schema.Struct({ title: Schema.String }))
+ 
++const decodeSessionMove = Schema.decodeUnknownOption(Schema.Struct({ directory: Schema.String }))
++
+ const decodeRevertStage = Schema.decodeUnknownOption(Schema.Struct({ messageID: Schema.String }))
+ 
+ const decodePermissionReply = Schema.decodeUnknownOption(Schema.Struct({ decision: Permission.Reply }))
+diff --git a/packages/app/src/composer/model.ts b/packages/app/src/composer/model.ts
+index e19b4a7..63fb508 100644
+--- a/packages/app/src/composer/model.ts
++++ b/packages/app/src/composer/model.ts
+@@ -277,12 +277,14 @@ export function createComposerModel(adapter: ComposerAdapter, options?: { queue?
+     notify: {
+       missingSelection: () =>
+         showToast({
++          sound: "composer",
+           title: language.t("prompt.toast.modelAgentRequired.title"),
+           description: language.t("prompt.toast.modelAgentRequired.description"),
+         }),
+-      unqueueable: () => showToast({ title: language.t("prompt.toast.unqueueable.title") }),
++      unqueueable: () => showToast({ sound: "composer", title: language.t("prompt.toast.unqueueable.title") }),
+       failed: (kind, error) =>
+         showToast({
++          sound: "composer",
+           title: language.t(sendFailedTitle[kind]),
+           description:
+             kind === "command"
+@@ -368,15 +370,17 @@ export function createComposerModel(adapter: ComposerAdapter, options?: { queue?
+       directory: () => sdk().directory,
+       destination: useAttachmentDestination(adapter.controls),
+       isDialogActive: () => !!dialog.active,
+-      duplicate: () => showToast({ title: language.t("prompt.toast.attachmentDuplicate.title") }),
++      duplicate: () => showToast({ sound: "composer", title: language.t("prompt.toast.attachmentDuplicate.title") }),
+       onUploadError: (error) =>
+         showToast({
++          sound: "composer",
+           variant: "error",
+           title: language.t("prompt.toast.uploadFailed.title"),
+           description: composerErrorMessage(language, error),
+         }),
+       onError: (error) =>
+         showToast({
++          sound: "composer",
+           variant: "error",
+           title: language.t("common.requestFailed"),
+           description: error instanceof Error ? error.message : String(error),
+diff --git a/packages/app/src/home/projects/controller.tsx b/packages/app/src/home/projects/controller.tsx
+index f531d26..84cc3db 100644
+--- a/packages/app/src/home/projects/controller.tsx
++++ b/packages/app/src/home/projects/controller.tsx
+@@ -137,6 +137,7 @@ export function createHomeProjectsController(home: HomeController) {
+           )
+           .catch((cause: unknown) => {
+             showToast({
++              sound: "project",
+               title: language.t("common.requestFailed"),
+               description: errorMessage(cause, language.t("common.requestFailed")),
+             })
+diff --git a/packages/app/src/home/projects/region.tsx b/packages/app/src/home/projects/region.tsx
+index 19e1018..ae9a3fc 100644
+--- a/packages/app/src/home/projects/region.tsx
++++ b/packages/app/src/home/projects/region.tsx
+@@ -1,10 +1,12 @@
+ import type { HomeProjectsController } from "./controller"
+ import { HomeProjectsView } from "./view"
+ import type { HomeScrollController } from "../scroll"
++import type { ServerConnection } from "@/runtime/server/registry"
+ 
+ export function HomeProjects(props: {
+   projects: HomeProjectsController
+   scroll: HomeScrollController
++  onMoveSession: (server: ServerConnection.Any, directory: string, sessionID: string) => void
+   dropdown?: boolean
+ }) {
+   return (
+@@ -32,6 +34,7 @@ export function HomeProjects(props: {
+       canHideServer={props.projects.server.canHide}
+       onHideServer={props.projects.server.hide}
+       onMoveProject={props.projects.project.move}
++      onMoveSession={props.onMoveSession}
+       onSelectProject={props.projects.project.select}
+       onAddProjects={props.projects.project.add}
+       onOpenProjectNewSession={props.projects.project.openNewSession}
+diff --git a/packages/app/src/home/projects/reveal.ts b/packages/app/src/home/projects/reveal.ts
+index 5de6f83..0772eab 100644
+--- a/packages/app/src/home/projects/reveal.ts
++++ b/packages/app/src/home/projects/reveal.ts
+@@ -22,6 +22,7 @@ export function useRevealProject() {
+         .then((revealed) => {
+           if (revealed) return
+           showToast({
++            sound: "project",
+             variant: "error",
+             title: language.t("home.project.missing.title"),
+             description: language.t("home.project.missing.description", { name: displayName(project) }),
+@@ -29,6 +30,7 @@ export function useRevealProject() {
+         })
+         .catch((cause: unknown) =>
+           showToast({
++            sound: "project",
+             title: language.t("common.requestFailed"),
+             description: errorMessage(cause, language.t("common.requestFailed")),
+           }),
+diff --git a/packages/app/src/home/projects/view.css b/packages/app/src/home/projects/view.css
+index 759816f..c591c53 100644
+--- a/packages/app/src/home/projects/view.css
++++ b/packages/app/src/home/projects/view.css
+@@ -23,6 +23,13 @@
+   --home-row-opacity: 60%;
+ }
+ 
++/* Session drop target: keep the hover surface and add a ring so the row reads
++   as the destination rather than another hovered project. */
++[data-home-row][data-drop="true"] {
++  --home-row-surface: var(--v2-background-bg-layer-03);
++  box-shadow: inset 0 0 0 1px var(--v2-border-border-strong);
++}
++
+ /* Keep the background outside the button's disabled-content opacity. */
+ [data-home-row] > button {
+   background: transparent;
+diff --git a/packages/app/src/home/projects/view.tsx b/packages/app/src/home/projects/view.tsx
+index 1454f16..99c8453 100644
+--- a/packages/app/src/home/projects/view.tsx
++++ b/packages/app/src/home/projects/view.tsx
+@@ -1,4 +1,4 @@
+-import { createMemo, For, type JSX, onCleanup, Show, splitProps } from "solid-js"
++import { createEffect, createMemo, For, type JSX, onCleanup, Show, splitProps } from "solid-js"
+ import { createStore } from "solid-js/store"
+ import { Popover } from "@kobalte/core/popover"
+ import { DragDropProvider, PointerSensor } from "@dnd-kit/solid"
+@@ -27,6 +27,7 @@ import { ServerRowMenuView, serverMenuLabels } from "@/servers/registry/row-menu
+ import { ServerHealthIndicator } from "@/servers/registry/row"
+ import { type ServerHealth } from "@/runtime/server/health"
+ import { fileManagerApp } from "@/home/projects/file-manager"
++import { homeSessionDrop, endHomeSessionDrag } from "@/home/sessions/drag"
+ import "./view.css"
+ 
+ const HOME_PROJECT_NAV_LABEL = "min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap"
+@@ -65,6 +66,7 @@ export type HomeProjectsViewProps = {
+   canHideServer: (server: ServerConnection.Any) => boolean
+   onHideServer: (server: ServerConnection.Any) => void
+   onMoveProject: (server: ServerConnection.Any, worktree: string, index: number) => void
++  onMoveSession: (server: ServerConnection.Any, directory: string, sessionID: string) => void
+   onSelectProject: (server: ServerConnection.Any, directory: string) => void
+   onAddProjects: (server: ServerConnection.Any, directories: string[]) => void
+   onOpenProjectNewSession: (server: ServerConnection.Any, directory: string) => void
+@@ -664,6 +666,25 @@ function HomeProjectRow(
+     },
+   })
+ 
++  // Native session drags run beside the sortable pointer drag. The row's own
++  // dragleave clears the highlight when leaving to another row; the window
++  // listeners cover a cancelled drag (Escape) that never reaches a drop.
++  const [dropState, setDropState] = createStore<{ over: boolean }>({ over: false })
++
++  const dropTarget = (event: DragEvent) =>
++    serverUnreachable() ? undefined : homeSessionDrop(event, ServerConnection.key(props.server), props.project.worktree)
++
++  createEffect(() => {
++    if (!dropState.over) return
++    const reset = () => setDropState("over", false)
++    window.addEventListener("dragend", reset)
++    window.addEventListener("drop", reset)
++    onCleanup(() => {
++      window.removeEventListener("dragend", reset)
++      window.removeEventListener("drop", reset)
++    })
++  })
++
+   let pointerDownSelected: boolean | undefined
+   const contextMenuID = () => projectContextMenuID(props.server, props.project.worktree)
+   onCleanup(() => {
+@@ -680,7 +701,31 @@ function HomeProjectRow(
+       data-home-row
+       data-dimmed={serverUnreachable()}
+       data-dragging={sortable.isDragSource()}
++      data-drop={dropState.over ? "true" : undefined}
+       data-selected={props.selected ? "" : undefined}
++      onDragEnter={(event) => {
++        if (dropTarget(event)) setDropState("over", true)
++      }}
++      onDragOver={(event) => {
++        if (!dropTarget(event)) return
++
++        event.preventDefault()
++
++        if (event.dataTransfer) event.dataTransfer.dropEffect = "move"
++      }}
++      onDragLeave={(event) => {
++        if (event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget)) return
++        setDropState("over", false)
++      }}
++      onDrop={(event) => {
++        const drag = dropTarget(event)
++
++        if (!drag) return
++        event.preventDefault()
++        setDropState("over", false)
++        endHomeSessionDrag()
++        props.onMoveSession(props.server, props.project.worktree, drag.sessionID)
++      }}
+       onContextMenu={(event) => {
+         event.preventDefault()
+         props.onSetContextMenuOpen(contextMenuID(), true)
+diff --git a/packages/app/src/home/route.tsx b/packages/app/src/home/route.tsx
+index 188210b..d497ef8 100644
+--- a/packages/app/src/home/route.tsx
++++ b/packages/app/src/home/route.tsx
+@@ -28,7 +28,7 @@ export function Home() {
+     >
+       <Show when={mobile()}>
+         <div class="relative z-40 -mb-3 shrink-0 px-3 pt-3">
+-          <HomeProjects projects={projects} scroll={scroll} dropdown />
++          <HomeProjects projects={projects} scroll={scroll} onMoveSession={sessions.session.move} dropdown />
+         </div>
+       </Show>
+       <ScrollView
+@@ -46,7 +46,7 @@ export function Home() {
+           `}
+         >
+           <Show when={!mobile()}>
+-            <HomeProjects projects={projects} scroll={scroll} />
++            <HomeProjects projects={projects} scroll={scroll} onMoveSession={sessions.session.move} />
+           </Show>
+           <HomeSessions sessions={sessions} search={search} scroll={scroll} />
+         </div>
+diff --git a/packages/app/src/home/sessions/controller.tsx b/packages/app/src/home/sessions/controller.tsx
+index 3e27ebc..caa930d 100644
+--- a/packages/app/src/home/sessions/controller.tsx
++++ b/packages/app/src/home/sessions/controller.tsx
+@@ -22,8 +22,12 @@ import { sessionTreeIDs } from "@/session/requests/session-request-tree"
+ import { pathKey } from "@/workspaces/path-key"
+ import { fetchSessionExport, saveSessionExport, sessionExportFilename } from "@/session/commands/export"
+ import { usePlatform } from "@/runtime/platform/platform"
++import { useSettings } from "@/settings/model"
+ import { sessionLabel, sessionTitle } from "@/session/title"
+ import { showToast } from "@/shell/notifications/toast"
++import { playSoundById } from "@/shell/notifications/sound"
++import { displayName } from "@opencode/ui/project-avatar"
++import { getFilename } from "@opencode/util/path"
+ import { archiveHomeSession } from "./archive"
+ import type { HomeController } from "../model"
+ import { buildHomeSessionRecords, homeProjectForSession, homeSessionLocation, type HomeSessionRecord } from "./records"
+@@ -47,6 +51,7 @@ export function createHomeSessionsController(home: HomeController) {
+   const dialog = useDialog()
+   const language = useLanguage()
+   const platform = usePlatform()
++  const settings = useSettings()
+   const queryClient = useQueryClient()
+ 
+   const projectDirectories = createMemo(() => {
+@@ -204,6 +209,7 @@ export function createHomeSessionsController(home: HomeController) {
+       })
+       .catch((cause) => {
+         showToast({
++          sound: "session",
+           title: language.t("common.requestFailed"),
+           description: errorMessage(cause, language.t("common.requestFailed")),
+         })
+@@ -224,6 +230,7 @@ export function createHomeSessionsController(home: HomeController) {
+ 
+       if (!(await saveSessionExport(filename, data, platform))) return
+       showToast({
++        sound: "session",
+         variant: "success",
+         icon: "circle-check",
+         title: language.t("toast.session.export.success.title"),
+@@ -231,6 +238,7 @@ export function createHomeSessionsController(home: HomeController) {
+       })
+     } catch (cause) {
+       showToast({
++        sound: "session",
+         variant: "error",
+         title: language.t("toast.session.export.failed.title"),
+         description: cause instanceof Error ? cause.message : language.t("toast.session.export.failed.description"),
+@@ -238,6 +246,38 @@ export function createHomeSessionsController(home: HomeController) {
+     }
+   }
+ 
++  const move = async (conn: ServerConnection.Any, directory: string, sessionID: string) => {
++    const ctx = home.server.context(conn)
++    const project = ctx.projects.list().find((item) => pathKey(item.worktree) === pathKey(directory))
++    const name = project ? displayName(project) : getFilename(directory)
++
++    // The server queues the move behind the running step and publishes
++    // `session.moved` when it applies. That event only patches sessions the
++    // live store already holds, so load the record before asking to move.
++    await ctx.data.session.sync(sessionID).catch(() => undefined)
++
++    try {
++      await ctx.sdk.api.session.move({ sessionID, directory })
++
++      if (settings.sounds.moveEnabled()) void playSoundById(settings.sounds.move())
++      showToast({
++        // The dedicated move sound above already played.
++        silent: true,
++        variant: "success",
++        icon: "circle-check",
++        title: language.t("toast.session.move.success.title"),
++        description: language.t("toast.session.move.success.description", { project: name }),
++      })
++    } catch (cause) {
++      showToast({
++        sound: "session",
++        variant: "error",
++        title: language.t("session.location.moveFailed"),
++        description: errorMessage(cause, language.t("session.location.moveFailed")),
++      })
++    }
++  }
++
+   const remove = async (server: ServerConnection.Key, session: SessionInfo) => {
+     const conn = home.server.list().find((item) => ServerConnection.key(item) === server)
+     const ctx = conn ? home.server.context(conn) : undefined
+@@ -258,6 +298,7 @@ export function createHomeSessionsController(home: HomeController) {
+       })
+       .catch((cause) => {
+         showToast({
++          sound: "session",
+           title: language.t("session.delete.failed.title"),
+           description: errorMessage(cause, language.t("session.delete.failed.title")),
+         })
+@@ -371,6 +412,7 @@ export function createHomeSessionsController(home: HomeController) {
+           remove() {},
+           onError: (cause) =>
+             showToast({
++              sound: "session",
+               title: language.t("common.requestFailed"),
+               description: errorMessage(cause, language.t("common.requestFailed")),
+             }),
+@@ -378,6 +420,7 @@ export function createHomeSessionsController(home: HomeController) {
+       },
+       rename,
+       export: exportSession,
++      move,
+       showDelete: (server: ServerConnection.Key, session: SessionInfo) =>
+         dialog.show(() => <DeleteDialog server={server} session={session} />),
+     },
+diff --git a/packages/app/src/home/sessions/drag.ts b/packages/app/src/home/sessions/drag.ts
+new file mode 100644
+index 0000000..d226738
+--- /dev/null
++++ b/packages/app/src/home/sessions/drag.ts
+@@ -0,0 +1,46 @@
++import type { ServerConnection } from "@/runtime/server/registry"
++import { pathKey } from "@/workspaces/path-key"
++
++// Custom type lets drop targets recognize home session drags and keeps the
++// payload out of the clipboard while other drag sources are active.
++export const HOME_SESSION_DRAG_TYPE = "application/x-opencode-home-session"
++
++export type HomeSessionDrag = {
++  server: ServerConnection.Key
++  sessionID: string
++  // Project that currently owns the session, resolved with the same sandbox
++  // and project-ID rules as the row. A session cannot move to its own project.
++  project: string
++}
++
++// The same window owns the drag source and every drop target. A module-level
++// reference avoids routing transient pointer state through the whole page.
++let active: HomeSessionDrag | undefined
++
++export function beginHomeSessionDrag(event: DragEvent, drag: HomeSessionDrag) {
++  active = drag
++  // Chromium only starts a native drag once some data is set. The custom type
++  // is what drop targets check; the plain text keeps the browser fallback sane.
++  event.dataTransfer?.setData(HOME_SESSION_DRAG_TYPE, drag.sessionID)
++  event.dataTransfer?.setData("text/plain", drag.sessionID)
++
++  if (event.dataTransfer) event.dataTransfer.effectAllowed = "move"
++}
++
++// Returns the drag when the target can accept it. Servers are separate
++// session stores, so only projects on the session's own server qualify.
++export function homeSessionDrop(event: DragEvent, server: ServerConnection.Key, project: string) {
++  const drag = active
++
++  if (!drag || drag.server !== server) return
++
++  if (pathKey(drag.project) === pathKey(project)) return
++
++  if (!event.dataTransfer?.types.includes(HOME_SESSION_DRAG_TYPE)) return
++
++  return drag
++}
++
++export function endHomeSessionDrag() {
++  active = undefined
++}
+diff --git a/packages/app/src/home/sessions/view.tsx b/packages/app/src/home/sessions/view.tsx
+index f83940f..d171c16 100644
+--- a/packages/app/src/home/sessions/view.tsx
++++ b/packages/app/src/home/sessions/view.tsx
+@@ -16,6 +16,7 @@ import { SessionTabAvatarView } from "@/shell/layout/session-tab-avatar"
+ import { sessionLabel } from "@/session/title"
+ import { shouldOpenSessionInBackground } from "./open"
+ import { createAltHold } from "./alt-hold"
++import { beginHomeSessionDrag, endHomeSessionDrag } from "./drag"
+ import "./view.css"
+ import {
+   HomeSessionStatusController,
+@@ -38,7 +39,7 @@ const HOME_SESSION_LONG_PRESS_MS = 500
+ function isBackgroundOpen(event: MouseEvent) {
+   return shouldOpenSessionInBackground({
+     button: event.button,
+-    mac: typeof navigator === "object" && /(Mac|iPod|iPhone|iPad)/.test(navigator.platform),
++    mac: /(Mac|iPod|iPhone|iPad)/.test(globalThis.navigator?.platform ?? ""),
+     meta: event.metaKey,
+     ctrl: event.ctrlKey,
+     shift: event.shiftKey,
+@@ -507,6 +508,7 @@ function HomeSessionRow(
+   const sessionID = () => props.record.session.id
+   const menu = () => (props.rowUI.menu?.id === sessionID() ? props.rowUI.menu : undefined)
+   const editor = () => (props.rowUI.editor?.id === sessionID() ? props.rowUI.editor : undefined)
++  const [dragState, setDragState] = createStore<{ dragging: boolean }>({ dragging: false })
+   let longPressTimer: ReturnType<typeof setTimeout> | undefined
+   let longPressStart: { x: number; y: number } | undefined
+   let suppressClick = false
+@@ -583,6 +585,22 @@ function HomeSessionRow(
+       data-project-name={!!showProjectName()}
+       data-session-id={props.record.session.id}
+       class="group/session relative flex h-10 min-w-0 items-center rounded-[6px] outline-none focus:outline-none focus-visible:outline-none"
++      classList={{ "opacity-50": dragState.dragging }}
++      onDragStart={(event) => {
++        // The rename editor can still start its own text drags.
++        if (!(event.target instanceof Element) || !event.target.closest('[data-component="home-session-row"]')) return
++
++        beginHomeSessionDrag(event, {
++          server: props.server,
++          sessionID: sessionID(),
++          project: props.record.project.worktree,
++        })
++        setDragState("dragging", true)
++      }}
++      onDragEnd={() => {
++        endHomeSessionDrag()
++        setDragState("dragging", false)
++      }}
+       onContextMenu={(event) => {
+         // While renaming, keep the native menu so paste and spelling work.
+         if (editor()) return
+@@ -649,6 +667,7 @@ function HomeSessionRow(
+         <button
+           type="button"
+           data-component="home-session-row"
++          draggable={true}
+           aria-haspopup="menu"
+           aria-expanded={!!menu()}
+           class={`
+diff --git a/packages/app/src/new-session/composer-adapter.ts b/packages/app/src/new-session/composer-adapter.ts
+index e0aa500..e3c3d35 100644
+--- a/packages/app/src/new-session/composer-adapter.ts
++++ b/packages/app/src/new-session/composer-adapter.ts
+@@ -108,6 +108,7 @@ export function createNewSessionComposerAdapter(props: {
+         () => ({ ok: true as const }),
+         (error) => {
+           showToast({
++            sound: "composer",
+             title: language.t("prompt.toast.sessionCreateFailed.title"),
+             description: errorMessage(language, error),
+           })
+@@ -215,6 +216,7 @@ async function resolveSessionDirectory(input: {
+     branch: input.branch,
+   }).catch((error) => {
+     showToast({
++      sound: "workspace",
+       title: input.language.t("prompt.toast.worktreeCreateFailed.title"),
+       description: errorMessage(input.language, error),
+     })
+diff --git a/packages/app/src/new-session/mcp.ts b/packages/app/src/new-session/mcp.ts
+index 26e67db..8178b34 100644
+--- a/packages/app/src/new-session/mcp.ts
++++ b/packages/app/src/new-session/mcp.ts
+@@ -124,6 +124,7 @@ export function createDraftMcpControls(input: { draftID: string; worktree: () =>
+       return apply(directory, states)
+         .catch((error) => {
+           showToast({
++            sound: "provider",
+             variant: "error",
+             title: language.t("session.summary.mcp.prepareFailed"),
+             description: error instanceof Error ? error.message : String(error),
+diff --git a/packages/app/src/providers/connect/dialog.tsx b/packages/app/src/providers/connect/dialog.tsx
+index 15fe537..5264da5 100644
+--- a/packages/app/src/providers/connect/dialog.tsx
++++ b/packages/app/src/providers/connect/dialog.tsx
+@@ -515,6 +515,7 @@ function ProviderConnection(props: {
+ 
+       dialog.close()
+       showToast({
++        sound: "provider",
+         variant: "success",
+         icon: "circle-check",
+         title: language.t("provider.connect.toast.connected.title", { provider: provider().name }),
+diff --git a/packages/app/src/providers/credentials/dialog.tsx b/packages/app/src/providers/credentials/dialog.tsx
+index 3939415..3afc02e 100644
+--- a/packages/app/src/providers/credentials/dialog.tsx
++++ b/packages/app/src/providers/credentials/dialog.tsx
+@@ -113,6 +113,7 @@ export function CustomProviderForm(props: { autofocus?: boolean } = {}) {
+     onSuccess: (result) => {
+       dialog.close()
+       showToast({
++        sound: "provider",
+         variant: "success",
+         icon: "circle-check",
+         title: language.t("provider.connect.toast.connected.title", { provider: result.name }),
+@@ -121,7 +122,7 @@ export function CustomProviderForm(props: { autofocus?: boolean } = {}) {
+     },
+     onError: (err) => {
+       const message = err instanceof Error ? err.message : String(err)
+-      showToast({ title: language.t("common.requestFailed"), description: message })
++      showToast({ sound: "provider", title: language.t("common.requestFailed"), description: message })
+     },
+   }))
+ 
+diff --git a/packages/app/src/runtime/i18n/en.ts b/packages/app/src/runtime/i18n/en.ts
+index a6842d8..558cb8a 100644
+--- a/packages/app/src/runtime/i18n/en.ts
++++ b/packages/app/src/runtime/i18n/en.ts
+@@ -428,6 +428,8 @@ export const dict = {
+   "toast.session.export.success.description": "Saved session to {{filename}}",
+   "toast.session.export.failed.title": "Failed to export session",
+   "toast.session.export.failed.description": "An error occurred while exporting the session",
++  "toast.session.move.success.title": "Session moved",
++  "toast.session.move.success.description": "Moved to {{project}}",
+   "toast.session.copyID.failed.title": "Failed to copy session ID",
+   "toast.session.copyID.failed.description": "An error occurred while copying the session ID",
+   "toast.project.copyID.failed.title": "Failed to copy project ID",
+@@ -849,6 +851,7 @@ export const dict = {
+   "settings.general.row.pinchZoom.description": "Allow trackpad pinch and Ctrl-scroll gestures to zoom",
+ 
+   "sound.option.none": "None",
++  "sound.option.inherit": "Use general sound",
+   "sound.option.alert01": "Alert 01",
+   "sound.option.alert02": "Alert 02",
+   "sound.option.alert03": "Alert 03",
+@@ -909,6 +912,37 @@ export const dict = {
+   "settings.general.sounds.permissions.description": "Play sound when a permission is required",
+   "settings.general.sounds.errors.title": "Errors",
+   "settings.general.sounds.errors.description": "Play sound when an error occurs",
++  "settings.general.sounds.move.title": "Session moved",
++  "settings.general.sounds.move.description": "Play sound when a session is moved to another project",
++  "settings.general.sounds.toasts.title": "Toasts",
++  "settings.general.sounds.toasts.description": "Play a sound when a toast appears. Individual toasts can override it.",
++  "settings.general.sounds.toasts.individual.title": "Individual toast sounds",
++  "settings.general.sounds.toasts.individual.description":
++    "Choose a sound for each toast family. Unconfigured toasts use the general toast sound.",
++  "settings.general.sounds.toasts.individual.configure": "Configure",
++  "settings.general.sounds.toasts.individual.hide": "Done",
++  "settings.general.sounds.toasts.session.title": "Sessions",
++  "settings.general.sounds.toasts.session.description":
++    "Exporting, deleting, renaming, copying, forking, and stopping sessions",
++  "settings.general.sounds.toasts.project.title": "Projects",
++  "settings.general.sounds.toasts.project.description": "Opening, revealing, reloading, and copying projects",
++  "settings.general.sounds.toasts.workspace.title": "Workspaces and files",
++  "settings.general.sounds.toasts.workspace.description":
++    "Creating worktrees, managing workspaces, and loading files",
++  "settings.general.sounds.toasts.provider.title": "Providers",
++  "settings.general.sounds.toasts.provider.description":
++    "Connecting, disconnecting, and switching provider accounts",
++  "settings.general.sounds.toasts.composer.title": "Prompts and composer",
++  "settings.general.sounds.toasts.composer.description":
++    "Sending prompts, queueing messages, uploading files, and creating sessions",
++  "settings.general.sounds.toasts.request.title": "Requests and permissions",
++  "settings.general.sounds.toasts.request.description":
++    "Answering permission and form requests, and reverting changes",
++  "settings.general.sounds.toasts.server.title": "Servers",
++  "settings.general.sounds.toasts.server.description": "Connecting to servers and reloading project data",
++  "settings.general.sounds.toasts.settings.title": "Settings",
++  "settings.general.sounds.toasts.settings.description":
++    "Changing settings, editing shortcuts, and loading notices",
+ 
+   "settings.shortcuts.title": "Keyboard shortcuts",
+   "settings.shortcuts.reset.button": "Reset to defaults",
+diff --git a/packages/app/src/runtime/server/runtime.tsx b/packages/app/src/runtime/server/runtime.tsx
+index 13e686e..7da3a5d 100644
+--- a/packages/app/src/runtime/server/runtime.tsx
++++ b/packages/app/src/runtime/server/runtime.tsx
+@@ -182,6 +182,7 @@ function createServerController(
+     directory: "",
+     onError(error) {
+       showToast({
++        sound: "server",
+         variant: "error",
+         title: language.t("common.requestFailed"),
+         description: formatServerError(error, language.t),
+diff --git a/packages/app/src/runtime/server/sync.tsx b/packages/app/src/runtime/server/sync.tsx
+index 1c739c2..1f21094 100644
+--- a/packages/app/src/runtime/server/sync.tsx
++++ b/packages/app/src/runtime/server/sync.tsx
+@@ -149,6 +149,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK, data: Data) {
+         data.location.mcp.resource.sync({ directory }),
+       ]).catch((err) => {
+         showToast({
++          sound: "project",
+           variant: "error",
+           title: language.t("toast.project.reloadFailed.title", { project: getFilename(directory) }),
+           description: formatServerError(err, language.t),
+diff --git a/packages/app/src/servers/registry/controller.ts b/packages/app/src/servers/registry/controller.ts
+index 74f9805..f146f76 100644
+--- a/packages/app/src/servers/registry/controller.ts
++++ b/packages/app/src/servers/registry/controller.ts
+@@ -43,6 +43,7 @@ export function useServerActionsController() {
+       server.remove(key)
+     } catch (err) {
+       showToast({
++        sound: "server",
+         variant: "error",
+         title: language.t("common.requestFailed"),
+         description: err instanceof Error ? err.message : String(err),
+diff --git a/packages/app/src/session/commands/fork-dialog.tsx b/packages/app/src/session/commands/fork-dialog.tsx
+index 7305b89..ce53f62 100644
+--- a/packages/app/src/session/commands/fork-dialog.tsx
++++ b/packages/app/src/session/commands/fork-dialog.tsx
+@@ -86,7 +86,7 @@ export const DialogFork: Component = () => {
+       })
+       .catch((cause: unknown) => {
+         const message = cause instanceof Error ? cause.message : String(cause)
+-        showToast({ title: language.t("common.requestFailed"), description: message })
++        showToast({ sound: "session", title: language.t("common.requestFailed"), description: message })
+       })
+   }
+ 
+diff --git a/packages/app/src/session/commands/use-session-commands.tsx b/packages/app/src/session/commands/use-session-commands.tsx
+index ebfba7a..c9c6d95 100644
+--- a/packages/app/src/session/commands/use-session-commands.tsx
++++ b/packages/app/src/session/commands/use-session-commands.tsx
+@@ -144,6 +144,7 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
+ 
+       if (!(await saveSessionExport(filename, data, platform))) return
+       showToast({
++        sound: "session",
+         variant: "success",
+         icon: "circle-check",
+         title: language.t("toast.session.export.success.title"),
+@@ -151,6 +152,7 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
+       })
+     } catch (err) {
+       showToast({
++        sound: "session",
+         variant: "error",
+         title: language.t("toast.session.export.failed.title"),
+         description: err instanceof Error ? err.message : language.t("toast.session.export.failed.description"),
+@@ -166,6 +168,7 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
+     try {
+       await (platform.writeClipboardText?.(sessionID) ?? navigator.clipboard.writeText(sessionID))
+       showToast({
++        sound: "session",
+         variant: "success",
+         icon: "circle-check",
+         title: language.t("common.copied"),
+@@ -173,6 +176,7 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
+       })
+     } catch (err) {
+       showToast({
++        sound: "session",
+         variant: "error",
+         title: language.t("toast.session.copyID.failed.title"),
+         description: err instanceof Error ? err.message : language.t("toast.session.copyID.failed.description"),
+@@ -188,6 +192,7 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
+     try {
+       await (platform.writeClipboardText?.(projectID) ?? navigator.clipboard.writeText(projectID))
+       showToast({
++        sound: "project",
+         variant: "success",
+         icon: "circle-check",
+         title: language.t("common.copied"),
+@@ -195,6 +200,7 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
+       })
+     } catch (err) {
+       showToast({
++        sound: "project",
+         variant: "error",
+         title: language.t("toast.project.copyID.failed.title"),
+         description: err instanceof Error ? err.message : language.t("toast.project.copyID.failed.description"),
+@@ -246,6 +252,7 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
+ 
+     if (!range) {
+       showToast({
++        sound: "session",
+         title: language.t("toast.context.noLineSelection.title"),
+         description: language.t("toast.context.noLineSelection.description"),
+       })
+@@ -281,6 +288,7 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
+ 
+     if (!active) {
+       showToast({
++        sound: "request",
+         title: language.t("toast.permissions.autoaccept.off.title"),
+         description: language.t("toast.permissions.autoaccept.off.description"),
+       })
+@@ -289,6 +297,7 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
+     }
+ 
+     showToast({
++      sound: "request",
+       title: project
+         ? language.t("toast.permissions.autoaccept.project.title")
+         : language.t("toast.permissions.autoaccept.on.title"),
+@@ -307,7 +316,7 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
+     if (!sessionID) return
+ 
+     await data.session.compact({ sessionID, model: actions.model() }).catch((cause: unknown) => {
+-      showToast({ title: formatServerError(cause, language.t, language.t("common.requestFailed")) })
++      showToast({ sound: "session", title: formatServerError(cause, language.t, language.t("common.requestFailed")) })
+     })
+   }
+ 
+diff --git a/packages/app/src/session/composer/location-missing.tsx b/packages/app/src/session/composer/location-missing.tsx
+index 8043d98..0ed5f8f 100644
+--- a/packages/app/src/session/composer/location-missing.tsx
++++ b/packages/app/src/session/composer/location-missing.tsx
+@@ -29,7 +29,8 @@ export function SessionLocationMissing(props: { sessionID: string; projectID: st
+       await server.ctx.sync.worktrees.refresh(projectID)
+       const items = await server.ctx.sync.worktrees.list(projectID)
+ 
+-      if (!items) showToast({ variant: "error", title: language.t("session.location.worktreesFailed") })
++      if (!items)
++        showToast({ sound: "workspace", variant: "error", title: language.t("session.location.worktreesFailed") })
+ 
+       return items ?? []
+     },
+@@ -63,6 +64,7 @@ export function SessionLocationMissing(props: { sessionID: string; projectID: st
+     onError: (error) => {
+       setState("restoreFocus", true)
+       showToast({
++        sound: "session",
+         variant: "error",
+         title: language.t("session.location.moveFailed"),
+         description: error instanceof Error ? error.message : language.t("common.requestFailed"),
+diff --git a/packages/app/src/session/composer/queue.ts b/packages/app/src/session/composer/queue.ts
+index e5337e8..4fb058d 100644
+--- a/packages/app/src/session/composer/queue.ts
++++ b/packages/app/src/session/composer/queue.ts
+@@ -39,7 +39,7 @@ export function createSessionQueue(input: {
+   const location = useWorkspaceLocation()
+   const language = useLanguage()
+   const [state, setState] = createStore<{ editing?: { id: string; stash: EditStash } }>({})
+-  const notify = () => showToast({ title: language.t("common.requestFailed") })
++  const notify = () => showToast({ sound: "composer", title: language.t("common.requestFailed") })
+ 
+   const mutation = useMutation(() => ({
+     mutationFn: async (
+@@ -216,7 +216,7 @@ export function createSessionQueue(input: {
+     if (!item) return
+ 
+     if (input.draft.mode.current() !== "normal") {
+-      showToast({ title: language.t("session.queue.undoShell") })
++      showToast({ sound: "composer", title: language.t("session.queue.undoShell") })
+ 
+       return
+     }
+@@ -238,7 +238,7 @@ export function createSessionQueue(input: {
+   // Re-admitting a queued prompt commits a staged revert, which drops every prompt queued after its boundary.
+   const refuseReverted = () => {
+     if (!data.session.get(input.sessionID)?.revert) return false
+-    showToast({ title: language.t("session.queue.reverted") })
++    showToast({ sound: "composer", title: language.t("session.queue.reverted") })
+ 
+     return true
+   }
+diff --git a/packages/app/src/session/composer/region.tsx b/packages/app/src/session/composer/region.tsx
+index 1315a86..f3644d6 100644
+--- a/packages/app/src/session/composer/region.tsx
++++ b/packages/app/src/session/composer/region.tsx
+@@ -228,7 +228,7 @@ export function createActiveSessionRegion(input: {
+   )
+ 
+   const notifyFailed = () => {
+-    showToast({ title: language.t("common.requestFailed") })
++    showToast({ sound: "composer", title: language.t("common.requestFailed") })
+   }
+ 
+   const pendingSteer: NonNullable<SessionUserActions["pending"]> = {
+diff --git a/packages/app/src/session/header/session-running-menu.tsx b/packages/app/src/session/header/session-running-menu.tsx
+index 133f9b4..df4f751 100644
+--- a/packages/app/src/session/header/session-running-menu.tsx
++++ b/packages/app/src/session/header/session-running-menu.tsx
+@@ -139,6 +139,7 @@ export function SessionRunningMenu(props: {
+ 
+     void request.catch((error) =>
+       showToast({
++        sound: "session",
+         title: language.t("common.requestFailed"),
+         description: errorMessage(error, language.t("common.requestFailed")),
+       }),
+diff --git a/packages/app/src/session/requests/model.ts b/packages/app/src/session/requests/model.ts
+index 844223d..f8dd7db 100644
+--- a/packages/app/src/session/requests/model.ts
++++ b/packages/app/src/session/requests/model.ts
+@@ -147,6 +147,7 @@ export function createSessionRequestModel() {
+     if (!sessionID) return
+     await serverSDK.api.session.background({ sessionID }).catch((error) => {
+       showToast({
++        sound: "request",
+         title: language.t("common.requestFailed"),
+         description: error instanceof Error ? error.message : String(error),
+       })
+@@ -175,6 +176,7 @@ export function createSessionRequestModel() {
+       .reply({ sessionID: perm.sessionID, requestID: perm.id, decision: response })
+       .catch((error) => {
+         showToast({
++          sound: "request",
+           title: language.t("common.requestFailed"),
+           description: error instanceof Error ? error.message : String(error),
+         })
+diff --git a/packages/app/src/session/requests/session-elicitation-dock.tsx b/packages/app/src/session/requests/session-elicitation-dock.tsx
+index 5b47798..527934d 100644
+--- a/packages/app/src/session/requests/session-elicitation-dock.tsx
++++ b/packages/app/src/session/requests/session-elicitation-dock.tsx
+@@ -62,7 +62,8 @@ export function SessionElicitationDock(props: {
+     ),
+   })
+ 
+-  const fail = (error: Error) => showToast({ title: language.t("common.requestFailed"), description: error.message })
++  const fail = (error: Error) =>
++    showToast({ sound: "request", title: language.t("common.requestFailed"), description: error.message })
+ 
+   const input = () => ({ sessionID: props.request.sessionID, formID: props.request.id })
+ 
+diff --git a/packages/app/src/session/requests/session-question-dock.tsx b/packages/app/src/session/requests/session-question-dock.tsx
+index 36a01a0..ac4c01e 100644
+--- a/packages/app/src/session/requests/session-question-dock.tsx
++++ b/packages/app/src/session/requests/session-question-dock.tsx
+@@ -263,7 +263,8 @@ export const SessionQuestionDock: Component<{ request: FormInfo; onSubmit: () =>
+     })
+   })
+ 
+-  const fail = (err: Error) => showToast({ title: language.t("common.requestFailed"), description: err.message })
++  const fail = (err: Error) =>
++    showToast({ sound: "request", title: language.t("common.requestFailed"), description: err.message })
+ 
+   const replyMutation = useMutation(() => ({
+     mutationFn: (answer: FormAnswer) =>
+diff --git a/packages/app/src/session/revert.ts b/packages/app/src/session/revert.ts
+index ca79e16..4cd74b1 100644
+--- a/packages/app/src/session/revert.ts
++++ b/packages/app/src/session/revert.ts
+@@ -25,6 +25,7 @@ export function createSessionRevert(input: {
+       .then(() => true)
+       .catch((error) => {
+         showToast({
++          sound: "request",
+           title: language.t("common.requestFailed"),
+           description: error instanceof Error ? error.message : String(error),
+         })
+diff --git a/packages/app/src/session/session-identity-header.tsx b/packages/app/src/session/session-identity-header.tsx
+index 2f44367..08b024c 100644
+--- a/packages/app/src/session/session-identity-header.tsx
++++ b/packages/app/src/session/session-identity-header.tsx
+@@ -73,6 +73,7 @@ export function SessionProjectMenu(props: {
+     if (!canOpenPath() || !platform.openPath || !props.directory) return
+     void platform.openPath(props.directory).catch((cause: unknown) =>
+       showToast({
++        sound: "project",
+         title: language.t("common.requestFailed"),
+         description: errorMessage(cause, language.t("common.requestFailed")),
+       }),
+diff --git a/packages/app/src/session/timeline/controller.tsx b/packages/app/src/session/timeline/controller.tsx
+index bca709a..33cb882 100644
+--- a/packages/app/src/session/timeline/controller.tsx
++++ b/packages/app/src/session/timeline/controller.tsx
+@@ -204,7 +204,7 @@ export function createTimelineController(input: { session: TimelineSessionSource
+       .update({ sessionID: id, title: next })
+       .then(() => true)
+       .catch((error) => {
+-        showToast({ title: language.t("common.requestFailed"), description: errorMessage(error) })
++        showToast({ sound: "session", title: language.t("common.requestFailed"), description: errorMessage(error) })
+ 
+         return false
+       })
+@@ -238,6 +238,7 @@ export function createTimelineController(input: { session: TimelineSessionSource
+ 
+       if (!(await saveSessionExport(filename, data, platform))) return
+       showToast({
++        sound: "session",
+         variant: "success",
+         icon: "circle-check",
+         title: language.t("toast.session.export.success.title"),
+@@ -245,6 +246,7 @@ export function createTimelineController(input: { session: TimelineSessionSource
+       })
+     } catch (error) {
+       showToast({
++        sound: "session",
+         variant: "error",
+         title: language.t("toast.session.export.failed.title"),
+         description: error instanceof Error ? error.message : language.t("toast.session.export.failed.description"),
+@@ -265,7 +267,7 @@ export function createTimelineController(input: { session: TimelineSessionSource
+       .remove(id)
+       .then(() => true)
+       .catch((error) => {
+-        showToast({ title: language.t("session.delete.failed.title"), description: errorMessage(error) })
++        showToast({ sound: "session", title: language.t("session.delete.failed.title"), description: errorMessage(error) })
+ 
+         return false
+       })
+diff --git a/packages/app/src/settings/about/about.tsx b/packages/app/src/settings/about/about.tsx
+index 01ce931..02a1653 100644
+--- a/packages/app/src/settings/about/about.tsx
++++ b/packages/app/src/settings/about/about.tsx
+@@ -61,7 +61,7 @@ export function SettingsAbout(props: { active: boolean }) {
+     const loaded = await import("./notices/dialog").catch(() => undefined)
+ 
+     if (!loaded) {
+-      showToast({ variant: "error", title: language.t("settings.about.notices.loadFailed") })
++      showToast({ sound: "settings", variant: "error", title: language.t("settings.about.notices.loadFailed") })
+ 
+       return
+     }
+diff --git a/packages/app/src/settings/general/controllers.ts b/packages/app/src/settings/general/controllers.ts
+index e6e7c3d..2e05ce8 100644
+--- a/packages/app/src/settings/general/controllers.ts
++++ b/packages/app/src/settings/general/controllers.ts
+@@ -14,6 +14,10 @@ import {
+   useSettings,
+ } from "@/settings/model"
+ import { playSoundById, SOUND_OPTIONS } from "@/shell/notifications/sound"
++import {
++  TOAST_SOUND_CATEGORIES,
++  type ToastSoundCategory,
++} from "@/shell/notifications/toast-sound"
+ import { createSoundPreviewController } from "./behavior"
+ import { ServerConnection } from "@/runtime/server/registry"
+ import { useServerCtx } from "@/runtime/server/runtime"
+@@ -61,12 +65,13 @@ export function createServerShellController(server: Accessor<ServerConnection.An
+       actions.mutate({ ...previous, shell: value || undefined })
+       void serverCtx()
+         .sdk.api.config.update({ shell: value || null })
+-        .catch((error: unknown) => {
++        .catch((cause: unknown) => {
+           actions.mutate(previous)
+           showToast({
++            sound: "settings",
+             variant: "error",
+             title: language.t("common.requestFailed"),
+-            description: error instanceof Error ? error.message : language.t("common.requestFailed"),
++            description: cause instanceof Error ? cause.message : language.t("common.requestFailed"),
+           })
+         })
+     },
+@@ -115,10 +120,16 @@ export function createAppearanceSettingsController() {
+ 
+ const noneSound = { id: "none", label: "sound.option.none" } as const
+ 
++const inheritSound = { id: "inherit", label: "sound.option.inherit" } as const
++
+ export const soundOptions = [noneSound, ...SOUND_OPTIONS]
+ 
++export const toastSoundOptions = [inheritSound, ...soundOptions]
++
+ export type SoundSelectOption = (typeof soundOptions)[number]
+ 
++export type ToastSoundSelectOption = (typeof toastSoundOptions)[number]
++
+ export function createSoundSettingsController() {
+   const settings = useSettings()
+   const preview = createSoundPreviewController(playSoundById)
+@@ -152,6 +163,42 @@ export function createSoundSettingsController() {
+     },
+   })
+ 
++  const toastChannel = (kind: ToastSoundCategory) => ({
++    current: createMemo(() => {
++      const id = settings.sounds.toasts()[kind]
++
++      if (id === undefined) return inheritSound
++
++      if (id === "none") return noneSound
++
++      return soundOptions.find((option) => option.id === id) ?? inheritSound
++    }),
++    highlight: (option: ToastSoundSelectOption | undefined) => {
++      if (!option || option.id === "inherit") return
++      preview.play(option.id === "none" ? undefined : option.id)
++    },
++    select: (option: ToastSoundSelectOption | null) => {
++      if (!option) return
++
++      if (option.id === "inherit") {
++        settings.sounds.setToastSound(kind, undefined)
++        preview.stop()
++
++        return
++      }
++
++      if (option.id === "none") {
++        settings.sounds.setToastSound(kind, "none")
++        preview.stop()
++
++        return
++      }
++
++      settings.sounds.setToastSound(kind, option.id)
++      preview.play(option.id)
++    },
++  })
++
+   return {
+     agent: channel(
+       settings.sounds.agentEnabled,
+@@ -171,6 +218,22 @@ export function createSoundSettingsController() {
+       (value) => settings.sounds.setErrorsEnabled(value),
+       (id) => settings.sounds.setErrors(id),
+     ),
++    move: channel(
++      settings.sounds.moveEnabled,
++      settings.sounds.move,
++      (value) => settings.sounds.setMoveEnabled(value),
++      (id) => settings.sounds.setMove(id),
++    ),
++    toast: channel(
++      settings.sounds.toastEnabled,
++      settings.sounds.toast,
++      (value) => settings.sounds.setToastEnabled(value),
++      (id) => settings.sounds.setToast(id),
++    ),
++    // SAFETY: the map is built from the same category list that keys the record type.
++    toastKinds: Object.fromEntries(
++      TOAST_SOUND_CATEGORIES.map((category) => [category.id, toastChannel(category.id)]),
++    ) as Record<ToastSoundCategory, ReturnType<typeof toastChannel>>,
+   }
+ }
+ 
+diff --git a/packages/app/src/settings/model.test.ts b/packages/app/src/settings/model.test.ts
+index b83db39..7ca908f 100644
+--- a/packages/app/src/settings/model.test.ts
++++ b/packages/app/src/settings/model.test.ts
+@@ -116,6 +116,11 @@ describe("settings schema", () => {
+         permissions: "staplebops-02",
+         errorsEnabled: true,
+         errors: "nope-03",
++        moveEnabled: true,
++        move: "yup-01",
++        toastEnabled: true,
++        toast: "bip-bop-01",
++        toasts: {},
+       },
+     })
+   })
+diff --git a/packages/app/src/settings/model.tsx b/packages/app/src/settings/model.tsx
+index 8efa301..049d819 100644
+--- a/packages/app/src/settings/model.tsx
++++ b/packages/app/src/settings/model.tsx
+@@ -3,6 +3,7 @@ import { createEffect, createMemo } from "solid-js"
+ import { Effect, Option, Predicate, Schema, SchemaGetter } from "effect"
+ import { createSimpleContext } from "@opencode/ui/context"
+ import { timelinePresets, type TimelineCategory, type TimelineDetail } from "@opencode/session-ui/timeline/detail"
++import type { ToastSoundCategory } from "@/shell/notifications/toast-sound"
+ import { persisted } from "@/runtime/persistence/storage"
+ import { Persistence } from "@/runtime/persistence/schema"
+ import { ScopedKey, type ServerScope } from "@/runtime/server/scope"
+@@ -161,6 +162,11 @@ const soundsSchema = Persistence.struct({
+   permissions: Schema.String,
+   errorsEnabled: Schema.Boolean,
+   errors: Schema.String,
++  moveEnabled: Schema.Boolean,
++  move: Schema.String,
++  toastEnabled: Schema.Boolean,
++  toast: Schema.String,
++  toasts: Persistence.record(Schema.String),
+ })
+ 
+ export const settingsSchema = Persistence.struct({
+@@ -296,6 +302,11 @@ export const defaultSettings: Settings = {
+     permissions: "staplebops-02",
+     errorsEnabled: true,
+     errors: "nope-03",
++    moveEnabled: true,
++    move: "yup-01",
++    toastEnabled: true,
++    toast: "bip-bop-01",
++    toasts: {},
+   },
+ }
+ 
+@@ -511,6 +522,34 @@ export const { use: useSettings, provider: SettingsProvider } = createSimpleCont
+         setErrors(value: string) {
+           setStore("sounds", "errors", value)
+         },
++        moveEnabled: withFallback(() => store.sounds?.moveEnabled, defaultSettings.sounds.moveEnabled),
++        setMoveEnabled(value: boolean) {
++          setStore("sounds", "moveEnabled", value)
++        },
++        move: withFallback(() => store.sounds?.move, defaultSettings.sounds.move),
++        setMove(value: string) {
++          setStore("sounds", "move", value)
++        },
++        toastEnabled: withFallback(() => store.sounds?.toastEnabled, defaultSettings.sounds.toastEnabled),
++        setToastEnabled(value: boolean) {
++          setStore("sounds", "toastEnabled", value)
++        },
++        toast: withFallback(() => store.sounds?.toast, defaultSettings.sounds.toast),
++        setToast(value: string) {
++          setStore("sounds", "toast", value)
++        },
++        toasts: withFallback(() => store.sounds?.toasts, defaultSettings.sounds.toasts),
++        toastSound: (kind: ToastSoundCategory) => store.sounds?.toasts?.[kind],
++        setToastSound(kind: ToastSoundCategory, value: string | undefined) {
++          setStore("sounds", "toasts", (current) => {
++            const next = { ...current }
++
++            if (value === undefined) delete next[kind]
++            else next[kind] = value
++
++            return next
++          })
++        },
+       },
+     }
+   },
+diff --git a/packages/app/src/settings/notifications/notifications.tsx b/packages/app/src/settings/notifications/notifications.tsx
+index a87733a..88460ba 100644
+--- a/packages/app/src/settings/notifications/notifications.tsx
++++ b/packages/app/src/settings/notifications/notifications.tsx
+@@ -1,6 +1,7 @@
+-import { Component } from "solid-js"
++import { Component, For, Show, createSignal } from "solid-js"
+ import { Select } from "@opencode/ui/select"
+ import { Switch } from "@opencode/ui/switch"
++import { Button } from "@opencode/ui/button"
+ import { useLanguage } from "@/runtime/i18n/language"
+ import { useSettings } from "@/settings/model"
+ import { SettingsList } from "@/settings/list"
+@@ -8,8 +9,10 @@ import { SettingsRow } from "@/settings/row"
+ import {
+   createSoundSettingsController,
+   soundOptions,
++  toastSoundOptions,
+   type SoundSettingsController,
+ } from "@/settings/general/controllers"
++import { TOAST_SOUND_CATEGORIES } from "@/shell/notifications/toast-sound"
+ import "@/settings/settings.css"
+ 
+ const soundSettings = {
+@@ -28,10 +31,20 @@ const soundSettings = {
+     title: "settings.general.sounds.errors.title",
+     description: "settings.general.sounds.errors.description",
+   },
++  move: {
++    action: "settings-sounds-move",
++    title: "settings.general.sounds.move.title",
++    description: "settings.general.sounds.move.description",
++  },
++  toast: {
++    action: "settings-sounds-toasts",
++    title: "settings.general.sounds.toasts.title",
++    description: "settings.general.sounds.toasts.description",
++  },
+ } as const
+ 
+ const SoundSetting: Component<{
+-  kind: "agent" | "permissions" | "errors"
++  kind: "agent" | "permissions" | "errors" | "move" | "toast"
+   channel: SoundSettingsController["agent"]
+ }> = (props) => {
+   const language = useLanguage()
+@@ -58,6 +71,7 @@ export const SettingsNotifications: Component = () => {
+   const language = useLanguage()
+   const settings = useSettings()
+   const sounds = createSoundSettingsController()
++  const [toastKinds, setToastKinds] = createSignal(false)
+ 
+   return (
+     <>
+@@ -120,7 +134,53 @@ export const SettingsNotifications: Component = () => {
+             <SoundSetting kind="agent" channel={sounds.agent} />
+             <SoundSetting kind="permissions" channel={sounds.permissions} />
+             <SoundSetting kind="errors" channel={sounds.errors} />
++            <SoundSetting kind="move" channel={sounds.move} />
++            <SoundSetting kind="toast" channel={sounds.toast} />
++            <SettingsRow
++              title={language.t("settings.general.sounds.toasts.individual.title")}
++              description={language.t("settings.general.sounds.toasts.individual.description")}
++            >
++              <Button
++                type="button"
++                variant="ghost"
++                data-action="settings-sounds-toasts-individual"
++                aria-expanded={toastKinds()}
++                onClick={() => setToastKinds((open) => !open)}
++              >
++                {language.t(
++                  toastKinds()
++                    ? "settings.general.sounds.toasts.individual.hide"
++                    : "settings.general.sounds.toasts.individual.configure",
++                )}
++              </Button>
++            </SettingsRow>
+           </SettingsList>
++
++          <Show when={toastKinds()}>
++            <SettingsList>
++              <For each={TOAST_SOUND_CATEGORIES}>
++                {(category) => {
++                  const channel = sounds.toastKinds[category.id]
++
++                  return (
++                    <SettingsRow title={language.t(category.title)} description={language.t(category.description)}>
++                      <Select
++                        data-action={`settings-sounds-toasts-${category.id}`}
++                        options={toastSoundOptions}
++                        current={channel.current()}
++                        value={(option) => option.id}
++                        label={(option) => language.t(option.label)}
++                        onHighlight={channel.highlight}
++                        onSelect={channel.select}
++                        placement="bottom-end"
++                        gutter={6}
++                      />
++                    </SettingsRow>
++                  )
++                }}
++              </For>
++            </SettingsList>
++          </Show>
+         </div>
+       </div>
+     </>
+diff --git a/packages/app/src/settings/providers/account-actions.ts b/packages/app/src/settings/providers/account-actions.ts
+index ab5f83b..d90a26e 100644
+--- a/packages/app/src/settings/providers/account-actions.ts
++++ b/packages/app/src/settings/providers/account-actions.ts
+@@ -52,7 +52,8 @@ export function useProviderAccountActions(directory: () => string | undefined) {
+     }
+   }
+ 
+-  const fail = (message: string) => showToast({ title: language.t("common.requestFailed"), description: message })
++  const fail = (message: string) =>
++    showToast({ sound: "provider", title: language.t("common.requestFailed"), description: message })
+ 
+   const activate = (input: { integrationID: string; provider: string; account: ProviderAccount }) =>
+     sdk.api.credential
+@@ -61,6 +62,7 @@ export function useProviderAccountActions(directory: () => string | undefined) {
+       .then(() => settle(input.integrationID))
+       .then(() =>
+         showToast({
++          sound: "provider",
+           variant: "success",
+           icon: "circle-check",
+           title: language.t("settings.providers.account.switched.title", { provider: input.provider }),
+@@ -76,6 +78,7 @@ export function useProviderAccountActions(directory: () => string | undefined) {
+       .then(() => (input.final ? undefined : settle(input.integrationID)))
+       .then(() =>
+         showToast({
++          sound: "provider",
+           variant: "success",
+           icon: "circle-check",
+           title: input.final
+diff --git a/packages/app/src/settings/providers/providers.tsx b/packages/app/src/settings/providers/providers.tsx
+index 026a5cc..a83dd26 100644
+--- a/packages/app/src/settings/providers/providers.tsx
++++ b/packages/app/src/settings/providers/providers.tsx
+@@ -236,6 +236,7 @@ export const SettingsProviders: Component<{
+ 
+         if (credentials.length === 0) {
+           showToast({
++            sound: "provider",
+             title: language.t("common.requestFailed"),
+             description: language.t("provider.disconnect.toast.noCredentials.description", { provider: name }),
+           })
+@@ -248,6 +249,7 @@ export const SettingsProviders: Component<{
+         )
+         updateDisconnecting(ids, "removed")
+         showToast({
++          sound: "provider",
+           variant: "success",
+           icon: "circle-check",
+           title: language.t("provider.disconnect.toast.disconnected.title", { provider: name }),
+@@ -258,6 +260,7 @@ export const SettingsProviders: Component<{
+         updateDisconnecting(ids, undefined)
+         const message = formatServerError(err, language.t)
+         showToast({
++          sound: "provider",
+           title: language.t("common.requestFailed"),
+           description: language.tDynamic("provider.disconnect.toast.failed.description", message, { provider: name }),
+         })
+diff --git a/packages/app/src/settings/search-catalog.ts b/packages/app/src/settings/search-catalog.ts
+index 590c572..2f9b728 100644
+--- a/packages/app/src/settings/search-catalog.ts
++++ b/packages/app/src/settings/search-catalog.ts
+@@ -152,6 +152,30 @@ export const clientSettings: Entry<SettingsRootTab>[] = [
+     description: "settings.general.sounds.errors.description",
+     keywords: "sound audio errors",
+   },
++  {
++    tab: "notifications",
++    label: "settings.general.sounds.move.title",
++    target: "settings-sounds-move",
++    section: "settings.general.section.sounds",
++    description: "settings.general.sounds.move.description",
++    keywords: "sound audio session move moved project",
++  },
++  {
++    tab: "notifications",
++    label: "settings.general.sounds.toasts.title",
++    target: "settings-sounds-toasts",
++    section: "settings.general.section.sounds",
++    description: "settings.general.sounds.toasts.description",
++    keywords: "sound audio toast toasts notification",
++  },
++  {
++    tab: "notifications",
++    label: "settings.general.sounds.toasts.individual.title",
++    target: "settings-sounds-toasts-individual",
++    section: "settings.general.section.sounds",
++    description: "settings.general.sounds.toasts.individual.description",
++    keywords: "sound audio toast toasts individual override",
++  },
+ ]
+ 
+ export const serverSettings: Entry<SettingsServerTab>[] = [
+diff --git a/packages/app/src/settings/workspaces/workspaces.tsx b/packages/app/src/settings/workspaces/workspaces.tsx
+index ac2c9fe..fe83757 100644
+--- a/packages/app/src/settings/workspaces/workspaces.tsx
++++ b/packages/app/src/settings/workspaces/workspaces.tsx
+@@ -237,6 +237,7 @@ export const SettingsWorkspaces: Component<{
+ 
+   const blocked = (result: WorkspaceDeleteInspection) => {
+     showToast({
++      sound: "workspace",
+       variant: "error",
+       title: language.t("workspace.delete.failed.title"),
+       description: result.active
+@@ -267,6 +268,7 @@ export const SettingsWorkspaces: Component<{
+         .then(() => true)
+         .catch((error) => {
+           showToast({
++            sound: "workspace",
+             variant: "error",
+             title: language.t("workspace.delete.failed.title"),
+             description: error instanceof Error ? error.message : language.t("common.requestFailed"),
+@@ -314,6 +316,7 @@ export const SettingsWorkspaces: Component<{
+       await task()
+     } catch (error) {
+       showToast({
++        sound: "workspace",
+         variant: "error",
+         title: language.t("workspace.delete.failed.title"),
+         description: error instanceof Error ? error.message : language.t("common.requestFailed"),
+diff --git a/packages/app/src/shell/notifications/toast-sound.test.ts b/packages/app/src/shell/notifications/toast-sound.test.ts
+new file mode 100644
+index 0000000..75a5cb5
+--- /dev/null
++++ b/packages/app/src/shell/notifications/toast-sound.test.ts
+@@ -0,0 +1,32 @@
++import { describe, expect, test } from "bun:test"
++import { resolveToastSound } from "./toast-sound"
++
++const settings = (overrides: Record<string, string> = {}) => ({
++  enabled: true,
++  sound: "bip-bop-01",
++  overrides,
++})
++
++describe("toast sounds", () => {
++  test("falls back to the general sound", () => {
++    expect(resolveToastSound(settings(), { kind: "session" })).toBe("bip-bop-01")
++    expect(resolveToastSound({ ...settings(), enabled: false }, { kind: "session" })).toBeUndefined()
++  })
++
++  test("uses a configured toast sound even when the general sound is off", () => {
++    expect(resolveToastSound(settings({ session: "yup-02" }), { kind: "session" })).toBe("yup-02")
++    expect(resolveToastSound({ ...settings({ session: "yup-02" }), enabled: false }, { kind: "session" })).toBe("yup-02")
++  })
++
++  test("lets a toast silence its own sound", () => {
++    expect(resolveToastSound(settings({ session: "none" }), { kind: "session" })).toBeUndefined()
++  })
++
++  test("keeps dedicated toast sounds from playing twice", () => {
++    expect(resolveToastSound(settings({ session: "yup-02" }), { kind: "session", silent: true })).toBeUndefined()
++  })
++
++  test("uses the general sound for uncategorized toasts", () => {
++    expect(resolveToastSound(settings(), {})).toBe("bip-bop-01")
++  })
++})
+diff --git a/packages/app/src/shell/notifications/toast-sound.ts b/packages/app/src/shell/notifications/toast-sound.ts
+new file mode 100644
+index 0000000..b80e519
+--- /dev/null
++++ b/packages/app/src/shell/notifications/toast-sound.ts
+@@ -0,0 +1,67 @@
++export const TOAST_SOUND_CATEGORIES = [
++  {
++    id: "session",
++    title: "settings.general.sounds.toasts.session.title",
++    description: "settings.general.sounds.toasts.session.description",
++  },
++  {
++    id: "project",
++    title: "settings.general.sounds.toasts.project.title",
++    description: "settings.general.sounds.toasts.project.description",
++  },
++  {
++    id: "workspace",
++    title: "settings.general.sounds.toasts.workspace.title",
++    description: "settings.general.sounds.toasts.workspace.description",
++  },
++  {
++    id: "provider",
++    title: "settings.general.sounds.toasts.provider.title",
++    description: "settings.general.sounds.toasts.provider.description",
++  },
++  {
++    id: "composer",
++    title: "settings.general.sounds.toasts.composer.title",
++    description: "settings.general.sounds.toasts.composer.description",
++  },
++  {
++    id: "request",
++    title: "settings.general.sounds.toasts.request.title",
++    description: "settings.general.sounds.toasts.request.description",
++  },
++  {
++    id: "server",
++    title: "settings.general.sounds.toasts.server.title",
++    description: "settings.general.sounds.toasts.server.description",
++  },
++  {
++    id: "settings",
++    title: "settings.general.sounds.toasts.settings.title",
++    description: "settings.general.sounds.toasts.settings.description",
++  },
++] as const
++
++export type ToastSoundCategory = (typeof TOAST_SOUND_CATEGORIES)[number]["id"]
++
++export type ToastSoundSettings = {
++  enabled: boolean
++  sound: string
++  overrides: Record<string, string>
++}
++
++export function resolveToastSound(
++  settings: ToastSoundSettings,
++  input: { kind?: ToastSoundCategory; silent?: boolean },
++) {
++  if (input.silent) return undefined
++
++  const override = input.kind ? settings.overrides[input.kind] : undefined
++
++  if (override === "none") return undefined
++
++  if (override) return override
++
++  if (!settings.enabled) return undefined
++
++  return settings.sound === "none" ? undefined : settings.sound
++}
+diff --git a/packages/app/src/shell/notifications/toast.tsx b/packages/app/src/shell/notifications/toast.tsx
+index 0b64235..64e5159 100644
+--- a/packages/app/src/shell/notifications/toast.tsx
++++ b/packages/app/src/shell/notifications/toast.tsx
+@@ -1,26 +1,50 @@
+ import { Icon, type IconProps } from "@opencode/ui/icon"
+ import { Toast, showToast, toaster, type ToastOptions } from "@opencode/ui/toast"
+-import type { JSX } from "solid-js"
++import { onCleanup } from "solid-js"
++import { useSettings } from "@/settings/model"
++import { playSoundById } from "./sound"
++import { resolveToastSound, type ToastSoundCategory, type ToastSoundSettings } from "./toast-sound"
+ 
+ type AppToastOptions = Omit<ToastOptions, "icon"> & {
+   icon?: IconProps["name"]
++  sound?: ToastSoundCategory
++  silent?: boolean
+ }
+ 
++let readToastSound: (() => ToastSoundSettings) | undefined
++
+ export function ToastRegion() {
++  const settings = useSettings()
++
++  const read = () => ({
++    enabled: settings.sounds.toastEnabled(),
++    sound: settings.sounds.toast(),
++    overrides: settings.sounds.toasts(),
++  })
++
++  readToastSound = read
++  onCleanup(() => {
++    if (readToastSound === read) readToastSound = undefined
++  })
++
+   return <Toast.Region />
+ }
+ 
+-function showAppToast(options: AppToastOptions | string) {
+-  if (typeof options === "string") return showToast(options)
++function showAppToast(options: AppToastOptions) {
++  const { sound, silent, ...toast } = options
+ 
+-  return showToast({
+-    ...options,
+-    icon: resolveIcon(options.icon, options.variant),
+-    actions: options.actions?.map((action) => ({
++  const id = showToast({
++    ...toast,
++    icon: resolveIcon(toast.icon, toast.variant),
++    actions: toast.actions?.map((action) => ({
+       ...action,
+       variant: action.onClick === "dismiss" ? "secondary" : "primary",
+     })),
+   })
++
++  playToastSound(sound, silent)
++
++  return id
+ }
+ 
+ export { showAppToast as showToast }
+@@ -29,11 +53,20 @@ export function dismissToast(toastId: number) {
+   return toaster.dismiss(toastId)
+ }
+ 
++function playToastSound(kind: ToastSoundCategory | undefined, silent?: boolean) {
++  const read = readToastSound
++
++  if (!read) return
++  const id = resolveToastSound(read(), { kind, silent })
++
++  if (id) void playSoundById(id)
++}
++
+ function resolveIcon(icon: IconProps["name"] | undefined, variant: ToastOptions["variant"]) {
+   const name = icon ?? (variant === "success" ? "check" : undefined)
+ 
+   if (!name) return undefined
+ 
+   // Solid resolves JSX accessors under the toast's render owner, not this imperative call site.
+-  return (() => <Icon name={name} />) as unknown as JSX.Element
++  return () => <Icon name={name} />
+ }
+diff --git a/packages/app/src/shell/routes/session-ui-provider.tsx b/packages/app/src/shell/routes/session-ui-provider.tsx
+index e17c307..b04d6d4 100644
+--- a/packages/app/src/shell/routes/session-ui-provider.tsx
++++ b/packages/app/src/shell/routes/session-ui-provider.tsx
+@@ -55,7 +55,7 @@ export function SessionUIProvider(
+     const session = await serverSDK.api.session.get({ sessionID }).catch(() => undefined)
+ 
+     if (!session || session.time.archived) {
+-      showToast({ title: language.t("session.error.notFound") })
++      showToast({ sound: "session", title: language.t("session.error.notFound") })
+ 
+       return
+     }
+diff --git a/packages/app/src/shell/titlebar/tab-strip.tsx b/packages/app/src/shell/titlebar/tab-strip.tsx
+index 11a08b6..86ff3b3 100644
+--- a/packages/app/src/shell/titlebar/tab-strip.tsx
++++ b/packages/app/src/shell/titlebar/tab-strip.tsx
+@@ -143,6 +143,7 @@ function SessionTabEntry(props: {
+ 
+       if (current && currentCtx) currentCtx.data.session.remember({ ...current, title: value.title })
+       showToast({
++        sound: "session",
+         title: language.t("common.requestFailed"),
+         description: err instanceof Error ? err.message : undefined,
+       })
+diff --git a/packages/app/src/workspaces/files/model.tsx b/packages/app/src/workspaces/files/model.tsx
+index 97ba50a..ad9ee49 100644
+--- a/packages/app/src/workspaces/files/model.tsx
++++ b/packages/app/src/workspaces/files/model.tsx
+@@ -70,6 +70,7 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
+         ),
+       onError: (message) => {
+         showToast({
++          sound: "workspace",
+           variant: "error",
+           title: language.t("toast.file.listFailed.title"),
+           description: message,
+@@ -158,6 +159,7 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
+       if (silent || (notFound && extensions.files.opened().includes(file))) return
+ 
+       showToast({
++        sound: "workspace",
+         variant: "error",
+         title: language.t("toast.file.loadFailed.title"),
+         description: message,
