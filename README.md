@@ -2,7 +2,7 @@
 
 A small patch for **OpenCode Desktop 2.1.4** that lets you drag a session from the Home screen onto another project.
 
-The upstream-ready change is maintained separately as a clean branch based on `origin/dev`. Notification sounds are intentionally **not** part of that branch; they are a later, separate proposal.
+The upstream-ready change was extracted into a clean local branch based on `origin/dev`, but it has not been published to a fork yet. Notification sounds are intentionally **not** part of that branch; they are a later, separate proposal.
 
 ## What it does
 

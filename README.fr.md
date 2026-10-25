@@ -2,7 +2,7 @@
 
 Petit patch pour **OpenCode Desktop 2.1.4** qui permet de faire glisser une session depuis l'écran d'accueil vers un autre projet.
 
-La modification prête pour l'amont est maintenue séparément dans une branche propre basée sur `origin/dev`. Les sons de notification ne font volontairement **pas** partie de cette branche : ils feront l'objet d'une proposition séparée, plus tard.
+La modification prête pour l'amont a été extraite dans une branche locale propre basée sur `origin/dev`, mais elle n'a pas encore été publiée sur un fork. Les sons de notification ne font volontairement **pas** partie de cette branche : ils feront l'objet d'une proposition séparée, plus tard.
 
 > Version anglaise (principale) : [README.md](README.md)
 
